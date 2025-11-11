@@ -105,13 +105,31 @@ export class RAGService implements IRAGService {
 
   constructor() {
     // 默认配置
+    // 统一配置风格：仅使用扁平格式（RAG_VECTORIZER_*），兼容旧格式（API_URL, API_Key, WhitelistEmbeddingModel）以支持外部项目
+    const vectorizerApiUrl = 
+      process.env.RAG_VECTORIZER_API_URL ||    // 优先：扁平格式
+      process.env.API_URL ||                    // 兼容：旧格式（外部项目可能使用）
+      '';
+    
+    const vectorizerApiKey = 
+      process.env.RAG_VECTORIZER_API_KEY ||    // 优先：扁平格式
+      process.env.API_Key ||                    // 兼容：旧格式（外部项目可能使用）
+      '';
+    
+    const vectorizerModel = 
+      process.env.RAG_VECTORIZER_MODEL ||      // 优先：扁平格式
+      process.env.WhitelistEmbeddingModel ||   // 兼容：旧格式（外部项目可能使用）
+      'text-embedding-3-small';
+    
+    const vectorizerDim = process.env.RAG_VECTORIZER_DIMENSIONS;
+    
     this.config = {
-      workDir: './VectorStore',
+      workDir: process.env.RAG_STORAGE_PATH || './VectorStore',
       vectorizer: {
-        apiUrl: process.env.API_URL || '',
-        apiKey: process.env.API_Key || '',
-        model: process.env.WhitelistEmbeddingModel || 'text-embedding-3-small',
-        dimensions: this.getDefaultDimensions(process.env.WhitelistEmbeddingModel || 'text-embedding-3-small')
+        apiUrl: vectorizerApiUrl,
+        apiKey: vectorizerApiKey,
+        model: vectorizerModel,
+        dimensions: vectorizerDim ? parseInt(vectorizerDim) : this.getDefaultDimensions(vectorizerModel)
       },
       changeThreshold: 0.5,
       maxMemoryUsage: 500 * 1024 * 1024, // 500MB
@@ -133,6 +151,8 @@ export class RAGService implements IRAGService {
       'text-embedding-3-large': 3072,
       'text-embedding-ada-002': 1536,
       'text-embedding-ada-001': 1024,
+      'Qwen/Qwen3-Embedding-4B': 2560,
+      'Qwen/Qwen3-Embedding-2560': 2560,
     };
     return dimensionsMap[model] || 1536;
   }
@@ -149,7 +169,15 @@ export class RAGService implements IRAGService {
    */
   async initialize(config?: RAGConfig): Promise<void> {
     if (config) {
-      this.config = { ...this.config, ...config };
+      // 深度合并配置，特别是vectorizer配置需要合并而不是替换
+      this.config = {
+        ...this.config,
+        ...config,
+        vectorizer: config.vectorizer ? {
+          ...this.config.vectorizer,
+          ...config.vectorizer
+        } : this.config.vectorizer
+      };
     }
 
     // 创建工作目录
@@ -167,7 +195,7 @@ export class RAGService implements IRAGService {
    */
   async search(options: RAGSearchOptions): Promise<RAGResult[]> {
     const startTime = Date.now();
-    const k = options.k || 10;
+    const kInput = options.k || 10;
     const similarityThreshold = options.similarityThreshold || 0.0;
 
     try {
@@ -175,7 +203,7 @@ export class RAGService implements IRAGService {
       const queryVector = await this.getEmbedding(options.query);
 
       // 检查缓存
-      const cached = this.searchCache.get(options.knowledgeBase, queryVector, k);
+      const cached = this.searchCache.get(options.knowledgeBase, queryVector, kInput);
       if (cached) {
         this.log('Cache hit for search');
         return cached;
@@ -189,7 +217,17 @@ export class RAGService implements IRAGService {
       }
 
       // 搜索
-      const result = index.searchKnn(queryVector, k);
+      const maxElements = (index as any).getMaxElements ? (index as any).getMaxElements() : undefined;
+      const currentCount = index.getCurrentCount();
+      const effectiveK = (() => {
+        let value = Math.min(kInput, currentCount || 1);
+        if (maxElements && value > maxElements) {
+          value = maxElements;
+        }
+        return Math.max(1, value);
+      })();
+
+      const result = index.searchKnn(queryVector, effectiveK);
       const chunkMap = this.chunkMaps.get(options.knowledgeBase) || {};
 
       // 转换结果
@@ -211,7 +249,7 @@ export class RAGService implements IRAGService {
       }).filter(r => r.score >= similarityThreshold);
 
       // 缓存结果
-      this.searchCache.set(options.knowledgeBase, queryVector, k, results);
+      this.searchCache.set(options.knowledgeBase, queryVector, kInput, results);
 
       // 记录指标
       const duration = Date.now() - startTime;
@@ -394,9 +432,24 @@ export class RAGService implements IRAGService {
       // 创建新索引
       const dimensions = this.getDimensions();
       index = new HierarchicalNSW('cosine', dimensions);
-      index.initIndex(docs.length, 16, 200, 100);
+      const initialCapacity = Math.max(docs.length + 256, 1024);
+      index.initIndex(initialCapacity, 16, 200, 100);
       index.setEf(this.config.efSearch);
       this.indices.set(knowledgeBase, index);
+    } else {
+      // 确保索引容量足够
+      const getMaxElements = (index as any).getMaxElements;
+      const resizeIndex = (index as any).resizeIndex;
+      if (typeof getMaxElements === 'function' && typeof resizeIndex === 'function') {
+        const currentCount = index.getCurrentCount();
+        const maxElements = getMaxElements.call(index);
+        const required = currentCount + embeddings.length;
+        if (required > maxElements) {
+          const newCapacity = Math.max(required + 256, Math.floor(maxElements * 1.5));
+          resizeIndex.call(index, newCapacity);
+          this.log(`Index resized for ${knowledgeBase} from ${maxElements} to ${newCapacity}`);
+        }
+      }
     }
 
     // 添加向量
